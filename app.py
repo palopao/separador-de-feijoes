@@ -9,7 +9,6 @@ import streamlit as st
 # Configuração da página do Streamlit
 st.set_page_config(page_title="Separador de Feijões Interativo", layout="wide")
 
-
 # --- Função para processar cada feijão ---
 def processar_feijao(mask, cnt, img, gray, N_CORES, PIX_ANALISAR):
     bean_pixels = img[mask == 255].astype(np.float32)
@@ -17,7 +16,10 @@ def processar_feijao(mask, cnt, img, gray, N_CORES, PIX_ANALISAR):
         return None
 
     kmeans = MiniBatchKMeans(
-        n_clusters=N_CORES, random_state=42, batch_size=1024, n_init=5
+        n_clusters=N_CORES,
+        random_state=42,
+        batch_size=1024,
+        n_init=5,
     )
     if len(bean_pixels) > PIX_ANALISAR:
         idx = np.random.choice(len(bean_pixels), PIX_ANALISAR, replace=False)
@@ -59,7 +61,6 @@ st.info(
     "* Evite sombras excessivas, texturas ou superfícies refletoras sob os feijões."
 )
 
-# --- NOVA SECÇÃO: SELEÇÃO DO MÉTODO DE ENTRADA ---
 metodo_entrada = st.radio(
     "Como deseja adicionar as imagens dos feijões?",
     ["Carregar Ficheiros do Dispositivo", "Tirar Foto com a Câmara em Direto"],
@@ -79,7 +80,6 @@ if metodo_entrada == "Carregar Ficheiros do Dispositivo":
 else:
     foto_cam = st.camera_input("Aponte a câmara para os feijões e tire a foto")
     if foto_cam:
-        # Atribuímos um nome padrão à foto capturada pela câmara
         foto_cam.name = "captura_camara.png"
         imagens_para_processar = [foto_cam]
 
@@ -89,7 +89,7 @@ with st.expander("Parâmetros de Configuração"):
         MIN_AREA = st.number_input("Área mínima (px)", min_value=1, value=500, step=50)
 
         MIN_CIRCULARIDADE = st.number_input(
-            "Circularidade mínima", min_value=0.0, max_value=1.0, value=0.5, step=0.01
+            "Circularidade mínima", min_value=0.0, max_value=1.0, value=0.6, step=0.05
         )
 
     with col2:
@@ -97,7 +97,7 @@ with st.expander("Parâmetros de Configuração"):
             "Número de cores por feijão", min_value=1, value=2, step=1
         )
         PIX_ANALISAR = st.number_input(
-            "Pixels a analisar", min_value=100, value=2000, step=100
+            "Pixels a analisar (KMeans)", min_value=100, value=2000, step=100
         )
 
 executar = st.button("Executar Processamento")
@@ -108,7 +108,6 @@ if "resultados_imagens" not in st.session_state:
 if "todas_tabelas" not in st.session_state:
     st.session_state.todas_tabelas = []
 
-# Se o utilizador clicar em executar e existirem imagens
 if executar and imagens_para_processar:
     st.session_state.resultados_imagens = []
     st.session_state.todas_tabelas = []
@@ -133,17 +132,77 @@ if executar and imagens_para_processar:
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        thresh = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 51, 5
+        # ALGORITMO AUTO-ADAPTÁVEL: Escolhe a técnica baseada na cor do fundo
+
+        # 1. Usamos a normalização apenas para a deteção do fundo (para ser mais fiável)
+        gray_norm_check = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+        margens = np.concatenate(
+            [
+                gray_norm_check[0, :],
+                gray_norm_check[-1, :],
+                gray_norm_check[:, 0],
+                gray_norm_check[:, -1],
+            ]
         )
-        blur = cv2.GaussianBlur(thresh, (5, 5), 0)
-        edges = cv2.Canny(blur, 50, 150)
-        kernel = np.ones((3, 3), np.uint8)
-        edges = cv2.dilate(edges, kernel, iterations=2)
-        edges = cv2.erode(edges, kernel, iterations=2)
+        mediana_fundo = np.median(margens)
+
+        if mediana_fundo > 100:
+            # ==========================================
+            # CENÁRIO A: FUNDO CLARO (Usa a Lógica V1 EXATA)
+            # ==========================================
+            # Usa 'gray' diretamente e 'dist_factor' a 0.40, exatamente como na V1
+            thresh = cv2.adaptiveThreshold(
+                gray,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY_INV,
+                51,
+                5,
+            )
+            blur = cv2.GaussianBlur(thresh, (5, 5), 0)
+            edges = cv2.Canny(blur, 50, 150)
+            kernel = np.ones((3, 3), np.uint8)
+            edges = cv2.dilate(edges, kernel, iterations=2)
+            binary_mask = cv2.erode(edges, kernel, iterations=2)
+
+            dist_factor = 0.40
+
+        else:
+            # ==========================================
+            # CENÁRIO B: FUNDO ESCURO (Usa a Lógica V4 EXATA)
+            # ==========================================
+            blur = cv2.GaussianBlur(gray, (7, 7), 0)
+
+            v = np.median(blur)
+            sigma = 0.33
+            lower = int(max(0, (1.0 - sigma) * v))
+            upper = int(min(255, (1.0 + sigma) * v))
+
+            edges = cv2.Canny(blur, lower, upper)
+
+            kernel_ellipse = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            edges_closed = cv2.morphologyEx(
+                edges, cv2.MORPH_CLOSE, kernel_ellipse, iterations=2
+            )
+
+            binary_mask = np.zeros_like(gray)
+            contornos_borda, _ = cv2.findContours(
+                edges_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            cv2.drawContours(
+                binary_mask, contornos_borda, -1, 255, thickness=cv2.FILLED
+            )
+
+            binary_mask = cv2.morphologyEx(
+                binary_mask, cv2.MORPH_OPEN, kernel_ellipse, iterations=1
+            )
+
+            dist_factor = 0.45
+
+        # -------------------------------------------------------------
 
         contours, _ = cv2.findContours(
-            edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
         result = img.copy()
         tasks = []
@@ -162,11 +221,14 @@ if executar and imagens_para_processar:
             if circularidade >= MIN_CIRCULARIDADE:
                 tasks.append((mask, cnt, img, gray, N_CORES, PIX_ANALISAR))
             else:
+                # Separação Watershed usando o fator escolhido
                 x, y, w, h = cv2.boundingRect(cnt)
                 roi = mask[y : y + h, x : x + w]
                 roi_img = img[y : y + h, x : x + w]
                 dist = cv2.distanceTransform(roi, cv2.DIST_L2, 5)
-                _, sure_fg = cv2.threshold(dist, 0.4 * dist.max(), 255, 0)
+
+                # APLICAÇÃO DO FATOR DE DISTÂNCIA DINÂMICO
+                _, sure_fg = cv2.threshold(dist, dist_factor * dist.max(), 255, 0)
                 sure_fg = np.uint8(sure_fg)
                 unknown = cv2.subtract(roi, sure_fg)
                 num_markers, markers = cv2.connectedComponents(sure_fg)
@@ -198,11 +260,20 @@ if executar and imagens_para_processar:
         for i, row in enumerate(feijoes_data, start=1):
             cnt = row.pop("Contorno")
             cv2.drawContours(result, [cnt], -1, (0, 255, 0), 2)
-            x, y, w, h = cv2.boundingRect(cnt)
+
+            # Cálculo do centroóide para colocar o número no meio do feijão
+            M = cv2.moments(cnt)
+            if M["m00"] != 0:
+                cX = int(M["m10"] / M["m00"])
+                cY = int(M["m01"] / M["m00"])
+            else:
+                x, y, w, h = cv2.boundingRect(cnt)
+                cX, cY = x + w // 2, y + h // 2
+
             cv2.putText(
                 result,
                 f"{i}",
-                (x, y - 5),
+                (cX - 10, cY + 5),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
                 (0, 0, 255),
@@ -287,4 +358,4 @@ if st.session_state.resultados_imagens:
         ]
 
         df_estilizado = df_total.style.map(aplicar_cor_fundo, subset=colunas_cor)
-        st.dataframe(df_estilizado, width='stretch', hide_index=True)
+        st.dataframe(df_estilizado, width="stretch", hide_index=True)
