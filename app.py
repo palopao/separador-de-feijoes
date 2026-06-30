@@ -5,6 +5,7 @@ import pandas as pd
 from sklearn.cluster import MiniBatchKMeans
 import concurrent.futures
 import streamlit as st
+import base64
 
 # Configuração da página do Streamlit
 st.set_page_config(page_title="Separador de Feijões Interativo", layout="wide")
@@ -257,28 +258,25 @@ if executar and imagens_para_processar:
             results = list(executor.map(lambda p: processar_feijao(*p), tasks))
         feijoes_data = [r for r in results if r is not None]
 
+        coordenadas_feijoes = {}
+
         for i, row in enumerate(feijoes_data, start=1):
             cnt = row.pop("Contorno")
             cv2.drawContours(result, [cnt], -1, (0, 255, 0), 2)
 
-            # Cálculo do centroóide para colocar o número no meio do feijão
+            # Cálculo do centroóide e dimensões para o círculo de pesquisa
+            x, y, w, h = cv2.boundingRect(cnt)
             M = cv2.moments(cnt)
             if M["m00"] != 0:
                 cX = int(M["m10"] / M["m00"])
                 cY = int(M["m01"] / M["m00"])
             else:
-                x, y, w, h = cv2.boundingRect(cnt)
                 cX, cY = x + w // 2, y + h // 2
 
-            cv2.putText(
-                result,
-                f"{i}",
-                (cX - 10, cY + 5),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 0, 255),
-                2,
-            )
+            # Guardar o centro e calcular um raio para o círculo de pesquisa
+            raio = int(max(w, h) / 2) + 10
+            coordenadas_feijoes[i] = {"centro": (cX, cY), "raio": raio}
+
             row["Feijao"] = i
             row["Foto"] = nome_original
 
@@ -290,11 +288,9 @@ if executar and imagens_para_processar:
             df = df[cols]
             st.session_state.todas_tabelas.append(df)
 
-        _, img_encoded = cv2.imencode(".png", result)
-        img_bytes = img_encoded.tobytes()
-
+        # Guardamos a imagem base do OpenCV (matriz) e as coordenadas na memória
         st.session_state.resultados_imagens.append(
-            {"nome": nome_original, "bytes": img_bytes}
+            {"nome": nome_original, "img_base": result, "coords": coordenadas_feijoes}
         )
 
         progresso_barra.progress((idx_img + 1) / total_imagens)
@@ -310,38 +306,104 @@ elif executar and not imagens_para_processar:
 if st.session_state.resultados_imagens:
     for idx, item in enumerate(st.session_state.resultados_imagens):
         nome_img = item["nome"]
-        img_bytes = item["bytes"]
+        img_base = item["img_base"]
+        coords = item["coords"]
 
         st.write("---")
         st.subheader(f"Resultado: {nome_img}")
 
-        ctrl_col1, ctrl_col2 = st.columns([3, 1])
+        # Criar 4 colunas para os novos controlos
+        ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4 = st.columns([1.5, 1.5, 1.5, 1])
 
         with ctrl_col1:
             largura_img = st.slider(
-                f"Ajustar escala da imagem ({nome_img})",
-                min_value=200,
-                max_value=1200,
-                value=500,
-                step=50,
+                "Escala da imagem",
+                min_value=100,
+                max_value=750,
+                value=300,
+                step=10,
                 key=f"slider_{nome_img}_{idx}",
             )
 
         with ctrl_col2:
+            tamanho_num = st.slider(
+                "Tamanho dos números",
+                min_value=0.3,
+                max_value=4.0,
+                value=1.0,
+                step=0.1,
+                key=f"font_{nome_img}_{idx}",
+            )
+
+        with ctrl_col3:
+            max_feijao = max(coords.keys()) if coords else 0
+            feijao_pesquisa = st.number_input(
+                "Pesquisar Feijão Nº",
+                min_value=0,
+                max_value=max_feijao,
+                value=0,
+                step=1,
+                key=f"search_{nome_img}_{idx}",
+                help="Insira 0 para ver todos sem destaque.",
+            )
+
+        # Fazemos uma cópia da imagem para não alterar o ficheiro original em memória
+        img_display = img_base.copy()
+
+        # Desenhar os números e o círculo de pesquisa dinamicamente
+        for i, info in coords.items():
+            cX, cY = info["centro"]
+
+            if i == feijao_pesquisa:
+                # Desenhar um círculo vermelho espesso à volta do feijão pesquisado
+                cv2.circle(img_display, (cX, cY), info["raio"], (0, 0, 255), 4)
+                # Destacar também o número do feijão pesquisado (fica amarelo e maior)
+                cv2.putText(
+                    img_display,
+                    f"{i}",
+                    (cX - 10, cY + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    tamanho_num + 0.2,
+                    (0, 0, 255),
+                    max(2, int(tamanho_num * 2) + 1),
+                )
+            else:
+                # Desenhar o número normal (vermelho)
+                cv2.putText(
+                    img_display,
+                    f"{i}",
+                    (cX - 10, cY + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    tamanho_num,
+                    (0, 0, 255),
+                    max(1, int(tamanho_num * 2)),
+                )
+
+        # Converter a imagem modificada para bytes para o botão e para o HTML
+        _, img_encoded = cv2.imencode(".png", img_display)
+        img_bytes = img_encoded.tobytes()
+
+        with ctrl_col4:
             st.write("")
             st.download_button(
-                label="📥 Descarregar Imagem",
+                label="📥 Descarregar",
                 data=img_bytes,
                 file_name=f"processada_{nome_img}.png",
                 mime="image/png",
                 key=f"dl_{nome_img}_{idx}",
             )
 
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        # Converte a imagem em bytes para base64
+        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-        st.image(img_rgb, width=largura_img)
+        # Mantém a visualização com CSS que quebra os limites e adiciona barras de scroll
+        html_code = f"""
+        <div style="max-width: 100%; max-height: 80vh; overflow: auto; border: 1px solid #444; border-radius: 5px; width: fit-content; margin: 0 auto;">
+            <img src="data:image/png;base64,{img_b64}" style="width: {largura_img}px; max-width: none; max-height: none; height: auto; display: block;">
+        </div>
+        """
+
+        st.markdown(html_code, unsafe_allow_html=True)
 
     if st.session_state.todas_tabelas:
         st.write("---")
