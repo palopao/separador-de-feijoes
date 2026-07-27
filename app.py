@@ -2,16 +2,19 @@ import os
 import cv2
 import numpy as np
 import pandas as pd
-from sklearn.cluster import MiniBatchKMeans
+from sklearn.cluster import MiniBatchKMeans, KMeans
+from sklearn.preprocessing import StandardScaler
 import concurrent.futures
 import streamlit as st
 import base64
+from ultralytics import FastSAM
 
 # Configuração da página do Streamlit
-st.set_page_config(page_title="Separador de Feijões Interativo", layout="wide")
+st.set_page_config(page_title="Separador de Feijões com IA", layout="wide")
+
 
 # --- Função para processar cada feijão ---
-def processar_feijao(mask, cnt, img, gray, N_CORES, PIX_ANALISAR):
+def processar_feijao(mask, cnt, img, N_CORES, PIX_ANALISAR):
     bean_pixels = img[mask == 255].astype(np.float32)
     if len(bean_pixels) == 0:
         return None
@@ -35,7 +38,6 @@ def processar_feijao(mask, cnt, img, gray, N_CORES, PIX_ANALISAR):
     counts = counts[sorted_idx]
     percents = counts / counts.sum()
 
-    # Ordenar por luminosidade
     lum = 0.299 * colors[:, 2] + 0.587 * colors[:, 1] + 0.114 * colors[:, 0]
     lum_idx = np.argsort(-lum)
     colors = colors[lum_idx]
@@ -44,22 +46,26 @@ def processar_feijao(mask, cnt, img, gray, N_CORES, PIX_ANALISAR):
     area = cv2.contourArea(cnt)
     row = {"Contorno": cnt, "Area_px": int(area)}
 
+    features = [float(area)]
+
     for j, (color, p) in enumerate(zip(colors, percents)):
         hex_color = f"#{color[2]:02x}{color[1]:02x}{color[0]:02x}"
         row[f"Cor{j + 1}"] = hex_color
         row[f"Cor{j + 1}_%"] = round(float(p * 100), 2)
+        features.extend([float(color[0]), float(color[1]), float(color[2]), float(p)])
+
+    row["Features_Clustering"] = features
     return row
 
 
 # --- Interface Streamlit ---
-st.title("Separador de Feijões Interativo")
+st.title("Separador de Feijões Avançado")
 
-# Bloco de Instruções da Imagem
 st.info(
-    "**Requisitos Importantes para a Imagem:**\n"
-    "* A fotografia **deve ter um fundo de cor uniforme** (ex: um fundo totalmente branco, azul-escuro ou preto).\n"
-    "* O fundo escolhido deve ser de uma **cor nitidamente distinta da cor dos feijões** para garantir uma segmentação correta.\n"
-    "* Evite sombras excessivas, texturas ou superfícies refletoras sob os feijões."
+    "**Dica de Processamento:**\n"
+    "* O modelo de IA ignora o fundo automaticamente.\n"
+    "* O agrupamento considera Área, Cores (RGB) e a sua distribuição (%).\n"
+    "* Os 'melhores' feijões de um grupo são avaliados com base no seu tamanho (maior área)."
 )
 
 metodo_entrada = st.radio(
@@ -85,12 +91,11 @@ else:
         imagens_para_processar = [foto_cam]
 
 with st.expander("Parâmetros de Configuração"):
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         MIN_AREA = st.number_input("Área mínima (px)", min_value=1, value=500, step=50)
-
         MIN_CIRCULARIDADE = st.number_input(
-            "Circularidade mínima", min_value=0.0, max_value=1.0, value=0.6, step=0.05
+            "Circularidade mínima", min_value=0.0, max_value=1.0, value=0.5, step=0.05
         )
 
     with col2:
@@ -101,17 +106,25 @@ with st.expander("Parâmetros de Configuração"):
             "Pixels a analisar (KMeans)", min_value=100, value=2000, step=100
         )
 
+    with col3:
+        NUM_GRUPOS = st.number_input(
+            "Dividir feijões em X Grupos", min_value=1, max_value=10, value=2, step=1
+        )
+
 executar = st.button("Executar Processamento")
 
-# --- INICIALIZAÇÃO DA MEMÓRIA (SESSION STATE) ---
 if "resultados_imagens" not in st.session_state:
     st.session_state.resultados_imagens = []
-if "todas_tabelas" not in st.session_state:
-    st.session_state.todas_tabelas = []
+
+
+@st.cache_resource
+def carregar_modelo():
+    return FastSAM("FastSAM-s.pt")
+
 
 if executar and imagens_para_processar:
+    modelo_ia = carregar_modelo()
     st.session_state.resultados_imagens = []
-    st.session_state.todas_tabelas = []
 
     progresso_barra = st.progress(0)
     progresso_texto = st.empty()
@@ -131,140 +144,114 @@ if executar and imagens_para_processar:
             st.error(f"Não foi possível abrir a imagem {nome_original}.")
             continue
 
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        img_h, img_w = img.shape[:2]
+        area_total_imagem = img_h * img_w
 
-        # ALGORITMO AUTO-ADAPTÁVEL: Escolhe a técnica baseada na cor do fundo
+        # Guardamos a imagem LIMPA para poder desenhar dinamicamente mais tarde
+        img_clean = img.copy()
 
-        # 1. Usamos a normalização apenas para a deteção do fundo (para ser mais fiável)
-        gray_norm_check = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-        margens = np.concatenate(
-            [
-                gray_norm_check[0, :],
-                gray_norm_check[-1, :],
-                gray_norm_check[:, 0],
-                gray_norm_check[:, -1],
-            ]
+        resultados_sam = modelo_ia(
+            img, device="cpu", retina_masks=True, conf=0.5, iou=0.8, verbose=False
         )
-        mediana_fundo = np.median(margens)
 
-        if mediana_fundo > 100:
-            # ==========================================
-            # CENÁRIO A: FUNDO CLARO (Usa a Lógica V1 EXATA)
-            # ==========================================
-            # Usa 'gray' diretamente e 'dist_factor' a 0.40, exatamente como na V1
-            thresh = cv2.adaptiveThreshold(
-                gray,
-                255,
-                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY_INV,
-                51,
-                5,
-            )
-            blur = cv2.GaussianBlur(thresh, (5, 5), 0)
-            edges = cv2.Canny(blur, 50, 150)
-            kernel = np.ones((3, 3), np.uint8)
-            edges = cv2.dilate(edges, kernel, iterations=2)
-            binary_mask = cv2.erode(edges, kernel, iterations=2)
-
-            dist_factor = 0.40
-
-        else:
-            # ==========================================
-            # CENÁRIO B: FUNDO ESCURO (Usa a Lógica V4 EXATA)
-            # ==========================================
-            blur = cv2.GaussianBlur(gray, (7, 7), 0)
-
-            v = np.median(blur)
-            sigma = 0.33
-            lower = int(max(0, (1.0 - sigma) * v))
-            upper = int(min(255, (1.0 + sigma) * v))
-
-            edges = cv2.Canny(blur, lower, upper)
-
-            kernel_ellipse = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            edges_closed = cv2.morphologyEx(
-                edges, cv2.MORPH_CLOSE, kernel_ellipse, iterations=2
-            )
-
-            binary_mask = np.zeros_like(gray)
-            contornos_borda, _ = cv2.findContours(
-                edges_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
-            cv2.drawContours(
-                binary_mask, contornos_borda, -1, 255, thickness=cv2.FILLED
-            )
-
-            binary_mask = cv2.morphologyEx(
-                binary_mask, cv2.MORPH_OPEN, kernel_ellipse, iterations=1
-            )
-
-            dist_factor = 0.45
-
-        # -------------------------------------------------------------
-
-        contours, _ = cv2.findContours(
-            binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        result = img.copy()
         tasks = []
+        candidatos = []
 
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < MIN_AREA:
-                continue
-            perimetro = cv2.arcLength(cnt, True)
-            if perimetro == 0:
-                continue
-            circularidade = 4 * np.pi * (area / (perimetro * perimetro))
-            mask = np.zeros(gray.shape, np.uint8)
-            cv2.drawContours(mask, [cnt], -1, 255, -1)
+        if len(resultados_sam) > 0 and resultados_sam[0].masks is not None:
+            mascaras = resultados_sam[0].masks.data.cpu().numpy()
 
-            if circularidade >= MIN_CIRCULARIDADE:
-                tasks.append((mask, cnt, img, gray, N_CORES, PIX_ANALISAR))
+            if mascaras.shape[1:] != (img_h, img_w):
+                mascaras_resized = [
+                    cv2.resize(m, (img_w, img_h), interpolation=cv2.INTER_NEAREST)
+                    for m in mascaras
+                ]
             else:
-                # Separação Watershed usando o fator escolhido
-                x, y, w, h = cv2.boundingRect(cnt)
-                roi = mask[y : y + h, x : x + w]
-                roi_img = img[y : y + h, x : x + w]
-                dist = cv2.distanceTransform(roi, cv2.DIST_L2, 5)
+                mascaras_resized = mascaras
 
-                # APLICAÇÃO DO FATOR DE DISTÂNCIA DINÂMICO
-                _, sure_fg = cv2.threshold(dist, dist_factor * dist.max(), 255, 0)
-                sure_fg = np.uint8(sure_fg)
-                unknown = cv2.subtract(roi, sure_fg)
-                num_markers, markers = cv2.connectedComponents(sure_fg)
-                markers = markers + 1
-                markers[unknown == 255] = 0
-                markers = cv2.watershed(roi_img.copy(), markers)
+            for mask_array in mascaras_resized:
+                mask_uint8 = (mask_array * 255).astype(np.uint8)
+                contours, _ = cv2.findContours(
+                    mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
 
-                for m in range(2, num_markers + 1):
-                    submask = np.zeros_like(roi)
-                    submask[markers == m] = 255
-                    sub_contours, _ = cv2.findContours(
-                        submask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-                    )
-                    for sc in sub_contours:
-                        if cv2.contourArea(sc) < MIN_AREA:
-                            continue
-                        full_mask = np.zeros(gray.shape, np.uint8)
-                        cv2.drawContours(full_mask, [sc + (x, y)], -1, 255, -1)
-                        tasks.append(
-                            (full_mask, sc + (x, y), img, gray, N_CORES, PIX_ANALISAR)
+                for cnt in contours:
+                    area = cv2.contourArea(cnt)
+
+                    if area < MIN_AREA or area > (area_total_imagem * 0.5):
+                        continue
+
+                    perimetro = cv2.arcLength(cnt, True)
+                    if perimetro == 0:
+                        continue
+
+                    circularidade = 4 * np.pi * (area / (perimetro * perimetro))
+
+                    if circularidade >= MIN_CIRCULARIDADE:
+                        mask_clean = np.zeros((img_h, img_w), np.uint8)
+                        cv2.drawContours(mask_clean, [cnt], -1, 255, -1)
+                        candidatos.append(
+                            {"area": area, "cnt": cnt, "mask": mask_clean}
                         )
+
+            candidatos.sort(key=lambda x: x["area"], reverse=True)
+            mapa_ocupacao = np.zeros((img_h, img_w), dtype=np.uint8)
+
+            for cand in candidatos:
+                mask = cand["mask"]
+                intersecao = cv2.bitwise_and(mask, mapa_ocupacao)
+                area_intersecao = np.count_nonzero(intersecao)
+                area_mascara = np.count_nonzero(mask)
+
+                if area_mascara > 0 and (area_intersecao / area_mascara) > 0.3:
+                    continue
+
+                mapa_ocupacao = cv2.bitwise_or(mapa_ocupacao, mask)
+                tasks.append((mask, cand["cnt"], img, N_CORES, PIX_ANALISAR))
 
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=os.cpu_count()
         ) as executor:
             results = list(executor.map(lambda p: processar_feijao(*p), tasks))
+
         feijoes_data = [r for r in results if r is not None]
 
+        if len(feijoes_data) >= NUM_GRUPOS and NUM_GRUPOS > 1:
+            features_list = [f["Features_Clustering"] for f in feijoes_data]
+            scaler = StandardScaler()
+            features_scaled = scaler.fit_transform(features_list)
+
+            kmeans_grupos = KMeans(n_clusters=NUM_GRUPOS, random_state=42, n_init=10)
+            labels_grupos = kmeans_grupos.fit_predict(features_scaled)
+
+            for row, lbl in zip(feijoes_data, labels_grupos):
+                row["Grupo"] = f"Tipo {lbl + 1}"
+        else:
+            for row in feijoes_data:
+                row["Grupo"] = "Tipo 1"
+
         coordenadas_feijoes = {}
+        resumo_grupos = {}
 
         for i, row in enumerate(feijoes_data, start=1):
             cnt = row.pop("Contorno")
-            cv2.drawContours(result, [cnt], -1, (0, 255, 0), 2)
+            row.pop("Features_Clustering")
 
-            # Cálculo do centroóide e dimensões para o círculo de pesquisa
+            g_str = row["Grupo"]
+            grupo_num = int(g_str.split(" ")[1])
+
+            if g_str not in resumo_grupos:
+                resumo_grupos[g_str] = {"areas": [], "r": [], "g": [], "b": []}
+            resumo_grupos[g_str]["areas"].append(row["Area_px"])
+
+            hex_c = row["Cor1"].lstrip("#")
+            if len(hex_c) == 6:
+                r_val, g_val, b_val = tuple(
+                    int(hex_c[k : k + 2], 16) for k in (0, 2, 4)
+                )
+                resumo_grupos[g_str]["r"].append(r_val)
+                resumo_grupos[g_str]["g"].append(g_val)
+                resumo_grupos[g_str]["b"].append(b_val)
+
             x, y, w, h = cv2.boundingRect(cnt)
             M = cv2.moments(cnt)
             if M["m00"] != 0:
@@ -273,24 +260,33 @@ if executar and imagens_para_processar:
             else:
                 cX, cY = x + w // 2, y + h // 2
 
-            # Guardar o centro e calcular um raio para o círculo de pesquisa
             raio = int(max(w, h) / 2) + 10
-            coordenadas_feijoes[i] = {"centro": (cX, cY), "raio": raio}
 
+            # Guardamos toda a info para podermos desenhar apenas os pretendidos mais tarde
+            coordenadas_feijoes[i] = {
+                "centro": (cX, cY),
+                "raio": raio,
+                "cnt": cnt,
+                "grupo_num": grupo_num,
+            }
             row["Feijao"] = i
-            row["Foto"] = nome_original
 
+        df_imagem = pd.DataFrame()
         if feijoes_data:
             df = pd.DataFrame(feijoes_data)
-            cols = ["Foto", "Feijao"] + [
-                c for c in df.columns if c not in ["Foto", "Feijao"]
+            cols = ["Feijao", "Grupo"] + [
+                c for c in df.columns if c not in ["Feijao", "Grupo"]
             ]
-            df = df[cols]
-            st.session_state.todas_tabelas.append(df)
+            df_imagem = df[cols]
 
-        # Guardamos a imagem base do OpenCV (matriz) e as coordenadas na memória
         st.session_state.resultados_imagens.append(
-            {"nome": nome_original, "img_base": result, "coords": coordenadas_feijoes}
+            {
+                "nome": nome_original,
+                "img_clean": img_clean,
+                "coords": coordenadas_feijoes,
+                "tabela": df_imagem,
+                "resumo_grupos": resumo_grupos if NUM_GRUPOS > 1 else {},
+            }
         )
 
         progresso_barra.progress((idx_img + 1) / total_imagens)
@@ -304,120 +300,294 @@ elif executar and not imagens_para_processar:
 
 # --- RENDERIZAÇÃO DOS RESULTADOS GUARDADOS ---
 if st.session_state.resultados_imagens:
+
+    def aplicar_cor_fundo(valor):
+        if isinstance(valor, str) and valor.startswith("#") and len(valor) == 7:
+            return f"background-color: {valor}; color: {valor};"
+        return ""
+
+    # Dicionário de 10 cores BGR globais (OpenCV)
+    cores_bgr_global = {
+        1: (0, 255, 0),
+        2: (255, 0, 0),
+        3: (0, 255, 255),
+        4: (255, 0, 255),
+        5: (0, 165, 255),
+        6: (255, 255, 0),
+        7: (0, 0, 255),
+        8: (203, 192, 255),
+        9: (255, 255, 255),
+        10: (128, 0, 128),
+    }
+
     for idx, item in enumerate(st.session_state.resultados_imagens):
+        if idx > 0:
+            st.divider()
+
         nome_img = item["nome"]
-        img_base = item["img_base"]
+        img_clean = item["img_clean"]
         coords = item["coords"]
+        df_tabela = item["tabela"]
+        resumo_grupos = item.get("resumo_grupos", {})
 
-        st.write("---")
-        st.subheader(f"Resultado: {nome_img}")
+        st.subheader(f"Imagem: {nome_img}")
 
-        # Criar 4 colunas para os novos controlos
-        ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4 = st.columns([1.5, 1.5, 1.5, 1])
-
+        # --- CONTROLOS DE VISUALIZAÇÃO ---
+        ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
         with ctrl_col1:
             largura_img = st.slider(
-                "Escala da imagem",
-                min_value=100,
-                max_value=750,
-                value=300,
-                step=10,
-                key=f"slider_{nome_img}_{idx}",
+                "Escala da imagem", 100, 750, 300, 10, key=f"slider_{nome_img}_{idx}"
             )
-
         with ctrl_col2:
             tamanho_num = st.slider(
-                "Tamanho dos números",
-                min_value=0.3,
-                max_value=4.0,
-                value=1.0,
-                step=0.1,
-                key=f"font_{nome_img}_{idx}",
+                "Tamanho dos números", 0.3, 4.0, 1.0, 0.1, key=f"font_{nome_img}_{idx}"
             )
-
         with ctrl_col3:
             max_feijao = max(coords.keys()) if coords else 0
             feijao_pesquisa = st.number_input(
                 "Pesquisar Feijão Nº",
-                min_value=0,
-                max_value=max_feijao,
-                value=0,
-                step=1,
+                0,
+                max_feijao,
+                0,
+                1,
                 key=f"search_{nome_img}_{idx}",
-                help="Insira 0 para ver todos sem destaque.",
             )
 
-        # Fazemos uma cópia da imagem para não alterar o ficheiro original em memória
-        img_display = img_base.copy()
+        # --- FILTROS ---
 
-        # Desenhar os números e o círculo de pesquisa dinamicamente
+        # Estrutura plana de colunas com alinhamento vertical
+        # As proporções [1.3, 0.4, 0.7, 1.6] garantem que o texto fica colado à caixa e que há espaço para os botões +/-
+        filt_col1, filt_col2, filt_col3, filt_col4 = st.columns(
+            [1.5, 0.4, 0.8, 5], vertical_alignment="center"
+        )
+
+        with filt_col1:
+            destacar_melhores = st.toggle(
+                "Destacar Melhores por Grupo", value=False, key=f"tgl_{nome_img}_{idx}"
+            )
+
+        with filt_col2:
+            st.markdown("<p style='text-align: right; margin-bottom: 0;'><b>Top (X):</b></p>", unsafe_allow_html=True,)
+
+        with filt_col3:
+            top_x = st.number_input(
+                "Top (X)",
+                min_value=1,
+                max_value=50,
+                value=3,
+                step=1,
+                disabled=not destacar_melhores,
+                label_visibility="collapsed",
+                key=f"topx_{nome_img}_{idx}",
+            )
+
+        # --- DESENHO DINÂMICO DOS CONTORNOS ---
+        img_display = img_clean.copy()
+
+        # Determinar quais feijões desenhar (por defeito, todos)
+        feijoes_a_desenhar = set(coords.keys())
+
+        if destacar_melhores and not df_tabela.empty:
+            # Obtém os IDs (Feijao) dos X maiores feijões de cada grupo ordenando por Área
+            top_beans = (
+                df_tabela.sort_values("Area_px", ascending=False)
+                .groupby("Grupo")
+                .head(top_x)["Feijao"]
+                .tolist()
+            )
+            feijoes_a_desenhar = set(top_beans)
+
         for i, info in coords.items():
-            cX, cY = info["centro"]
+            if i in feijoes_a_desenhar:
+                cor_contorno = cores_bgr_global.get(info["grupo_num"], (255, 255, 255))
+                cv2.drawContours(img_display, [info["cnt"]], -1, cor_contorno, 3)
 
-            if i == feijao_pesquisa:
-                # Desenhar um círculo vermelho espesso à volta do feijão pesquisado
-                cv2.circle(img_display, (cX, cY), info["raio"], (0, 0, 255), 4)
-                # Destacar também o número do feijão pesquisado (fica amarelo e maior)
-                cv2.putText(
-                    img_display,
-                    f"{i}",
-                    (cX - 10, cY + 5),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    tamanho_num + 0.2,
-                    (0, 0, 255),
-                    max(2, int(tamanho_num * 2) + 1),
-                )
-            else:
-                # Desenhar o número normal (vermelho)
-                cv2.putText(
-                    img_display,
-                    f"{i}",
-                    (cX - 10, cY + 5),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    tamanho_num,
-                    (0, 0, 255),
-                    max(1, int(tamanho_num * 2)),
-                )
+                cX, cY = info["centro"]
+                if i == feijao_pesquisa:
+                    cv2.circle(img_display, (cX, cY), info["raio"], (0, 0, 255), 4)
+                    cv2.putText(
+                        img_display,
+                        f"{i}",
+                        (cX - 10, cY + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        tamanho_num + 0.2,
+                        (0, 0, 255),
+                        max(2, int(tamanho_num * 2) + 1),
+                    )
+                else:
+                    cv2.putText(
+                        img_display,
+                        f"{i}",
+                        (cX - 10, cY + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        tamanho_num,
+                        (0, 0, 255),
+                        max(1, int(tamanho_num * 2)),
+                    )
 
-        # Converter a imagem modificada para bytes para o botão e para o HTML
-        _, img_encoded = cv2.imencode(".png", img_display)
-        img_bytes = img_encoded.tobytes()
+        # --- PREPARAÇÃO DA IMAGEM PARA DESCARREGAR (COM LEGENDA NO FUNDO) ---
+        img_download = img_display.copy()
 
-        with ctrl_col4:
-            st.write("")
-            st.download_button(
-                label="📥 Descarregar",
-                data=img_bytes,
-                file_name=f"processada_{nome_img}.png",
-                mime="image/png",
-                key=f"dl_{nome_img}_{idx}",
+        if resumo_grupos:
+            num_grupos_reais = len(resumo_grupos)
+            altura_legenda = 50 + (35 * num_grupos_reais)
+            h, w, c = img_download.shape
+
+            img_padded = np.zeros((h + altura_legenda, w, c), dtype=np.uint8)
+            img_padded[:h, :w] = img_download
+
+            y_offset = h + 30
+            x_offset = 20
+
+            cv2.putText(
+                img_padded,
+                "Legenda dos Grupos (Caracteristicas):",
+                (x_offset, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
             )
+            y_offset += 35
 
-        # Converte a imagem em bytes para base64
-        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+            for g_num in range(1, 11):
+                g_str = f"Tipo {g_num}"
+                if g_str in resumo_grupos and len(resumo_grupos[g_str]["areas"]) > 0:
+                    avg_a = int(np.mean(resumo_grupos[g_str]["areas"]))
+                    avg_r = int(np.mean(resumo_grupos[g_str]["r"]))
+                    avg_g = int(np.mean(resumo_grupos[g_str]["g"]))
+                    avg_b = int(np.mean(resumo_grupos[g_str]["b"]))
 
-        # Mantém a visualização com CSS que quebra os limites e adiciona barras de scroll
+                    cor_contorno = cores_bgr_global.get(g_num, (255, 255, 255))
+
+                    cv2.rectangle(
+                        img_padded,
+                        (x_offset, y_offset - 15),
+                        (x_offset + 20, y_offset + 5),
+                        cor_contorno,
+                        -1,
+                    )
+                    cv2.rectangle(
+                        img_padded,
+                        (x_offset, y_offset - 15),
+                        (x_offset + 20, y_offset + 5),
+                        (255, 255, 255),
+                        1,
+                    )
+
+                    texto = f"{g_str}: ~{avg_a}px | Cor Principal: "
+                    cv2.putText(
+                        img_padded,
+                        texto,
+                        (x_offset + 30, y_offset),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (255, 255, 255),
+                        2,
+                    )
+
+                    (tw, th), _ = cv2.getTextSize(
+                        texto, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+                    )
+                    cv2.circle(
+                        img_padded,
+                        (x_offset + 30 + tw + 15, y_offset - 5),
+                        10,
+                        (avg_b, avg_g, avg_r),
+                        -1,
+                    )
+                    cv2.circle(
+                        img_padded,
+                        (x_offset + 30 + tw + 15, y_offset - 5),
+                        10,
+                        (255, 255, 255),
+                        1,
+                    )
+
+                    y_offset += 35
+
+            img_download = img_padded
+
+        # Codificar imagens
+        _, img_encoded_display = cv2.imencode(".png", img_display)
+        img_bytes_display = img_encoded_display.tobytes()
+
+        _, img_encoded_dl = cv2.imencode(".png", img_download)
+        img_bytes_dl = img_encoded_dl.tobytes()
+
+        # Mostrar imagem na UI
+        img_b64 = base64.b64encode(img_bytes_display).decode("utf-8")
         html_code = f"""
-        <div style="max-width: 100%; max-height: 80vh; overflow: auto; border: 1px solid #444; border-radius: 5px; width: fit-content; margin: 0 auto;">
+        <div style="max-width: 100%; max-height: 80vh; overflow: auto; border: 1px solid #444; border-radius: 5px; width: fit-content; margin: 0 auto; margin-bottom: 20px;">
             <img src="data:image/png;base64,{img_b64}" style="width: {largura_img}px; max-width: none; max-height: none; height: auto; display: block;">
         </div>
         """
-
         st.markdown(html_code, unsafe_allow_html=True)
 
-    if st.session_state.todas_tabelas:
-        st.write("---")
-        st.subheader("📊 Dados Analisados")
-        df_total = pd.concat(st.session_state.todas_tabelas, ignore_index=True)
+        # --- LEGENDA CENTRADA ---
+        if resumo_grupos:
+            legend_html = "<div style='display: flex; flex-wrap: wrap; justify-content: center; gap: 20px; padding: 15px; border: 1px solid rgba(255,255,255,0.2); border-radius: 8px; background-color: rgba(0,0,0,0.2); margin: 0 auto 30px auto; width: fit-content;'>"
 
-        def aplicar_cor_fundo(valor):
-            if isinstance(valor, str) and valor.startswith("#") and len(valor) == 7:
-                return f"background-color: {valor}; color: {valor};"
-            return ""
+            for g_num in range(1, 11):
+                g_str = f"Tipo {g_num}"
+                if g_str in resumo_grupos and len(resumo_grupos[g_str]["areas"]) > 0:
+                    avg_a = int(np.mean(resumo_grupos[g_str]["areas"]))
+                    avg_r = int(np.mean(resumo_grupos[g_str]["r"]))
+                    avg_g = int(np.mean(resumo_grupos[g_str]["g"]))
+                    avg_b = int(np.mean(resumo_grupos[g_str]["b"]))
 
-        colunas_cor = [
-            c for c in df_total.columns if c.startswith("Cor") and not c.endswith("%")
-        ]
+                    cores_rgb = {
+                        1: (0, 255, 0),
+                        2: (0, 0, 255),
+                        3: (255, 255, 0),
+                        4: (255, 0, 255),
+                        5: (255, 165, 0),
+                        6: (0, 255, 255),
+                        7: (255, 0, 0),
+                        8: (255, 192, 203),
+                        9: (255, 255, 255),
+                        10: (128, 0, 128),
+                    }
+                    cor_rgb_html = cores_rgb.get(g_num, (255, 255, 255))
 
-        df_estilizado = df_total.style.map(aplicar_cor_fundo, subset=colunas_cor)
-        st.dataframe(df_estilizado, width="stretch", hide_index=True)
+                    html_contour = (
+                        f"rgb({cor_rgb_html[0]}, {cor_rgb_html[1]}, {cor_rgb_html[2]})"
+                    )
+                    html_main = f"rgb({avg_r}, {avg_g}, {avg_b})"
+
+                    row_html = f"<div style='display: flex; align-items: center; gap: 10px; background-color: rgba(255,255,255,0.05); padding: 8px 12px; border-radius: 5px;'><div style='width: 16px; height: 16px; background-color: {html_contour}; border: 1px solid rgba(255,255,255,0.5); border-radius: 3px;' title='Cor do Contorno'></div><span style='font-size: 15px; font-weight: 600;'>{g_str}</span><span style='font-size: 14px; color: #ccc; margin-left: 5px;'>~{avg_a}px | Cor:</span><div style='width: 18px; height: 18px; background-color: {html_main}; border: 1px solid rgba(255,255,255,0.5); border-radius: 50%;' title='Cor Principal Média'></div></div>"
+                    legend_html += row_html
+
+            legend_html += "</div>"
+            st.markdown(legend_html, unsafe_allow_html=True)
+
+        # Botão de descarregar numa nova linha, centrado abaixo da legenda
+        dl_col1, dl_col2, dl_col3 = st.columns([1, 0.7, 1])
+        with dl_col2:
+            st.download_button(
+                label="📥 Descarregar Imagem Renderizada",
+                data=img_bytes_dl,
+                file_name=f"processada_{nome_img}.png",
+                mime="image/png",
+                key=f"dl_{nome_img}_{idx}",
+                use_container_width=True,
+            )
+
+        if not df_tabela.empty:
+            # Se o filtro estiver ativo, mostramos apenas os dados correspondentes aos feijões desenhados
+            df_para_mostrar = (
+                df_tabela
+                if not destacar_melhores
+                else df_tabela[df_tabela["Feijao"].isin(feijoes_a_desenhar)]
+            )
+
+            st.markdown("**Tabela de Dados:**")
+            colunas_cor = [
+                c
+                for c in df_para_mostrar.columns
+                if c.startswith("Cor") and not c.endswith("%")
+            ]
+            df_estilizado = df_para_mostrar.style.map(
+                aplicar_cor_fundo, subset=colunas_cor
+            )
+            st.dataframe(df_estilizado, width="stretch", hide_index=True)
