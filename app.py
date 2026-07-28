@@ -11,7 +11,7 @@ import base64
 from ultralytics import FastSAM
 
 # Configuração da página do Streamlit
-st.set_page_config(page_title="Separador de Feijões com IA", layout="wide")
+st.set_page_config(page_title="Separador de Feijões", layout="wide")
 
 
 # --- Função OTIMIZADA e ULTRA-RÁPIDA para processar cada feijão ---
@@ -108,13 +108,24 @@ def processar_feijao(
 
 
 # --- Interface Streamlit ---
-st.title("Separador de Feijões Avançado")
+st.title("Separador de Feijões")
 
-st.info(
-    "**Dica de Processamento:**\n"
-    "* O filtro de relevância (%) ignora reflexos ou pequenas variações, reduzindo as cores automaticamente de forma instantânea.\n"
-    "* Ajuste o 'Limiar Mínimo %' se quiser ser mais ou menos rigoroso com cores secundárias."
-)
+with st.expander("Dicas para Melhores Resultados", expanded=False):
+    st.markdown("""
+    **1. Como Tirar a Foto (Preparação)**
+    * **Fundo:** Utilize um fundo liso e de cor neutra (uma folha branca, cartolina preta ou azul) para contrastar com os feijões.
+    * **Iluminação:** Prefira luz natural ou iluminação uniforme. Evite sombras fortes e reflexos de luz diretos, pois alteram a perceção da cor da câmara.
+    * **Espaçamento:** Espalhe os feijões para que não se toquem nem fiquem sobrepostos. O programa deteta contornos isolados com muito mais precisão.
+
+    **2. Parâmetros de Configuração**
+    * **Área e Circularidade:** Se o programa estiver a detetar pequenas sujidades, sombras ou feijões partidos, aumente a *Área mínima* ou a *Circularidade mínima*.
+    * **Peso da Cor:** Se a separação por grupos estiver a focar-se muito no tamanho (juntando feijões de cores diferentes), aumente o *Peso da Cor* (ex: 4.0 ou 5.0).
+    * **Grupos (Auto vs Manual):** Se souber exatamente quantos tipos de feijões estão na imagem, desligue a *Deteção Auto de Grupos* e insira o número exato. Isto torna o processo mais rápido e preciso.
+
+    **3. Análise dos Resultados**
+    * **Destacar Melhores:** Nos resultados, ative o filtro "Destacar Melhores por Grupo" para identificar apenas os feijões maiores e mais representativos de cada categoria.
+    * **Ajustes:** Se a deteção de cores secundárias falhar ou captar manchas muito pequenas, aumente o *Limiar mínimo de área (%)* para ser mais rigoroso e clique em "Executar Processamento" novamente.
+    """)
 
 metodo_entrada = st.radio(
     "Como deseja adicionar as imagens dos feijões?",
@@ -138,7 +149,7 @@ else:
         foto_cam.name = "captura_camara.png"
         imagens_para_processar = [foto_cam]
 
-with st.expander("Parâmetros de Configuração", expanded=True):
+with st.expander("Parâmetros de Configuração", expanded=False):
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         MIN_AREA = st.number_input("Área mínima (px)", min_value=1, value=500, step=50)
