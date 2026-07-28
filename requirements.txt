@@ -3,3 +3,4 @@ opencv-python-headless
 numpy
 pandas
 scikit-learn
+ultralytics

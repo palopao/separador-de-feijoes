@@ -13,9 +13,9 @@ from ultralytics import FastSAM
 st.set_page_config(page_title="Separador de Feijões com IA", layout="wide")
 
 
-# --- Função para processar cada feijão ---
-def processar_feijao(mask, cnt, img, N_CORES, PIX_ANALISAR):
-    bean_pixels = img[mask == 255].astype(np.float32)
+# --- Função OTIMIZADA para processar cada feijão ---
+# Agora recebe apenas os pixeis já extraídos, poupando memória no Multithreading
+def processar_feijao(bean_pixels, cnt, N_CORES, PIX_ANALISAR):
     if len(bean_pixels) == 0:
         return None
 
@@ -146,8 +146,6 @@ if executar and imagens_para_processar:
 
         img_h, img_w = img.shape[:2]
         area_total_imagem = img_h * img_w
-
-        # Guardamos a imagem LIMPA para poder desenhar dinamicamente mais tarde
         img_clean = img.copy()
 
         resultados_sam = modelo_ia(
@@ -187,27 +185,49 @@ if executar and imagens_para_processar:
                     circularidade = 4 * np.pi * (area / (perimetro * perimetro))
 
                     if circularidade >= MIN_CIRCULARIDADE:
-                        mask_clean = np.zeros((img_h, img_w), np.uint8)
-                        cv2.drawContours(mask_clean, [cnt], -1, 255, -1)
+                        # OTIMIZAÇÃO: Extrair Bounding Box e criar apenas uma micro-máscara
+                        x, y, w, h = cv2.boundingRect(cnt)
+                        mask_roi = np.zeros((h, w), np.uint8)
+
+                        # Deslocar o contorno para desenhar no eixo zero do ROI
+                        cnt_offset = cnt - np.array([x, y])
+                        cv2.drawContours(mask_roi, [cnt_offset], -1, 255, -1)
+
                         candidatos.append(
-                            {"area": area, "cnt": cnt, "mask": mask_clean}
+                            {
+                                "area": area,
+                                "cnt": cnt,
+                                "mask_roi": mask_roi,
+                                "bbox": (x, y, w, h),
+                            }
                         )
 
             candidatos.sort(key=lambda x: x["area"], reverse=True)
             mapa_ocupacao = np.zeros((img_h, img_w), dtype=np.uint8)
 
             for cand in candidatos:
-                mask = cand["mask"]
-                intersecao = cv2.bitwise_and(mask, mapa_ocupacao)
+                x, y, w, h = cand["bbox"]
+                mask_roi = cand["mask_roi"]
+                mapa_roi = mapa_ocupacao[y : y + h, x : x + w]
+
+                # OTIMIZAÇÃO: Bitwise operations apenas no recorte minúsculo
+                intersecao = cv2.bitwise_and(mask_roi, mapa_roi)
                 area_intersecao = np.count_nonzero(intersecao)
-                area_mascara = np.count_nonzero(mask)
+                area_mascara = np.count_nonzero(mask_roi)
 
                 if area_mascara > 0 and (area_intersecao / area_mascara) > 0.3:
                     continue
 
-                mapa_ocupacao = cv2.bitwise_or(mapa_ocupacao, mask)
-                tasks.append((mask, cand["cnt"], img, N_CORES, PIX_ANALISAR))
+                # Atualizar o mapa global usando o recorte local
+                mapa_ocupacao[y : y + h, x : x + w] = cv2.bitwise_or(mapa_roi, mask_roi)
 
+                # OTIMIZAÇÃO: Extrair pixeis imediatamente usando o recorte da imagem
+                img_roi = img[y : y + h, x : x + w]
+                bean_pixels = img_roi[mask_roi == 255].astype(np.float32)
+
+                tasks.append((bean_pixels, cand["cnt"], N_CORES, PIX_ANALISAR))
+
+        # Execução das tarefas otimizada (passando matrizes muito mais leves)
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=os.cpu_count()
         ) as executor:
@@ -215,7 +235,7 @@ if executar and imagens_para_processar:
 
         feijoes_data = [r for r in results if r is not None]
 
-        if len(feijoes_data) >= NUM_GRUPOS and NUM_GRUPOS > 1:
+        if len(feijoes_data) >= NUM_GRUPOS > 1:
             features_list = [f["Features_Clustering"] for f in feijoes_data]
             scaler = StandardScaler()
             features_scaled = scaler.fit_transform(features_list)
@@ -262,7 +282,6 @@ if executar and imagens_para_processar:
 
             raio = int(max(w, h) / 2) + 10
 
-            # Guardamos toda a info para podermos desenhar apenas os pretendidos mais tarde
             coordenadas_feijoes[i] = {
                 "centro": (cX, cY),
                 "raio": raio,
@@ -354,11 +373,11 @@ if st.session_state.resultados_imagens:
             )
 
         # --- FILTROS ---
+        st.markdown("###### Filtro de Destaque")
 
-        # Estrutura plana de colunas com alinhamento vertical
-        # As proporções [1.3, 0.4, 0.7, 1.6] garantem que o texto fica colado à caixa e que há espaço para os botões +/-
+        # Estrutura plana de colunas para layout de filtros
         filt_col1, filt_col2, filt_col3, filt_col4 = st.columns(
-            [1.5, 0.4, 0.8, 5], vertical_alignment="center"
+            [1.5, 0.4, 1.5, 2.5], vertical_alignment="center"
         )
 
         with filt_col1:
@@ -367,7 +386,10 @@ if st.session_state.resultados_imagens:
             )
 
         with filt_col2:
-            st.markdown("<p style='text-align: right; margin-bottom: 0;'><b>Top (X):</b></p>", unsafe_allow_html=True,)
+            st.markdown(
+                "<p style='margin-bottom: 0;'>Top (X):</p>",
+                unsafe_allow_html=True,
+            )
 
         with filt_col3:
             top_x = st.number_input(
@@ -384,11 +406,9 @@ if st.session_state.resultados_imagens:
         # --- DESENHO DINÂMICO DOS CONTORNOS ---
         img_display = img_clean.copy()
 
-        # Determinar quais feijões desenhar (por defeito, todos)
         feijoes_a_desenhar = set(coords.keys())
 
         if destacar_melhores and not df_tabela.empty:
-            # Obtém os IDs (Feijao) dos X maiores feijões de cada grupo ordenando por Área
             top_beans = (
                 df_tabela.sort_values("Area_px", ascending=False)
                 .groupby("Grupo")
@@ -574,7 +594,6 @@ if st.session_state.resultados_imagens:
             )
 
         if not df_tabela.empty:
-            # Se o filtro estiver ativo, mostramos apenas os dados correspondentes aos feijões desenhados
             df_para_mostrar = (
                 df_tabela
                 if not destacar_melhores
