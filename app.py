@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 from sklearn.cluster import MiniBatchKMeans, KMeans
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import silhouette_score
 import concurrent.futures
 import streamlit as st
 import base64
@@ -13,23 +14,28 @@ from ultralytics import FastSAM
 st.set_page_config(page_title="Separador de Feijões com IA", layout="wide")
 
 
-# --- Função OTIMIZADA para processar cada feijão ---
-def processar_feijao(bean_pixels, cnt, N_CORES, PIX_ANALISAR):
+# --- Função OTIMIZADA e ULTRA-RÁPIDA para processar cada feijão ---
+def processar_feijao(
+    bean_pixels, cnt, AUTO_CORES, N_CORES_CONFIG, LIMIAR_PCT, PIX_ANALISAR
+):
     if len(bean_pixels) == 0:
         return None
 
-    # 1. Processamento de Cor (KMeans)
-    kmeans = MiniBatchKMeans(
-        n_clusters=N_CORES,
-        random_state=42,
-        batch_size=1024,
-        n_init=5,
-    )
+    # 1. Amostragem rápida de pixéis
     if len(bean_pixels) > PIX_ANALISAR:
         idx = np.random.choice(len(bean_pixels), PIX_ANALISAR, replace=False)
-        kmeans.fit(bean_pixels[idx])
+        pixels_sample = bean_pixels[idx]
     else:
-        kmeans.fit(bean_pixels)
+        pixels_sample = bean_pixels
+
+    # 2. Executa KMeans UMA ÚNICA VEZ (sem ciclos lentos)
+    kmeans = MiniBatchKMeans(
+        n_clusters=N_CORES_CONFIG,
+        random_state=42,
+        batch_size=1024,
+        n_init=3,
+    )
+    kmeans.fit(pixels_sample)
 
     colors = kmeans.cluster_centers_.astype(int)
     labels, counts = np.unique(kmeans.labels_, return_counts=True)
@@ -38,34 +44,42 @@ def processar_feijao(bean_pixels, cnt, N_CORES, PIX_ANALISAR):
     counts = counts[sorted_idx]
     percents = counts / counts.sum()
 
+    # --- DETEÇÃO AUTO RÁPIDA: Filtra cores irrelevantes/ruído ---
+    if AUTO_CORES and len(colors) > 1:
+        mask_relevante = percents >= (LIMIAR_PCT / 100.0)
+
+        # Garante que pelo menos a cor dominante é mantida
+        if not np.any(mask_relevante):
+            mask_relevante[0] = True
+
+        colors = colors[mask_relevante]
+        counts = counts[mask_relevante]
+        percents = counts / counts.sum()  # Re-normaliza as percentagens restantes
+
+    # Ordenação por luminância
     lum = 0.299 * colors[:, 2] + 0.587 * colors[:, 1] + 0.114 * colors[:, 0]
     lum_idx = np.argsort(-lum)
     colors = colors[lum_idx]
     percents = percents[lum_idx]
 
-    # 2. Extração de Métricas de Tamanho e Forma
+    # 3. Extração de Métricas de Tamanho e Forma
     area = cv2.contourArea(cnt)
-
-    # Bounding Box para calcular a Proporção (Alongamento)
     x, y, w, h = cv2.boundingRect(cnt)
     aspect_ratio = float(w) / h if h != 0 else 0.0
 
-    # Convex Hull para calcular a Solidez (Feijões "Tortos")
     hull = cv2.convexHull(cnt)
     hull_area = cv2.contourArea(hull)
     solidity = float(area) / hull_area if hull_area != 0 else 0.0
 
-    # Momentos de Hu para caracterização avançada da forma (invariante à rotação)
     moments = cv2.moments(cnt)
     hu_moments = cv2.HuMoments(moments).flatten()
     hu1 = -np.sign(hu_moments[0]) * np.log10(abs(hu_moments[0]) + 1e-10)
     hu2 = -np.sign(hu_moments[1]) * np.log10(abs(hu_moments[1]) + 1e-10)
 
-    # 3. Guardar dados para a Tabela Visual (AGORA APENAS COM ÁREA E CONTORNO)
+    # 4. Guardar dados para a Tabela Visual
     row = {"Contorno": cnt, "Area_px": int(area)}
 
-    # 4. Construir o Vetor de Características para o IA agrupar
-    # As métricas de forma entram aqui para formar os grupos, mas ficam ocultas da tabela
+    # 5. Construir o Vetor de Características para a IA agrupar
     features = [
         float(area),
         float(aspect_ratio),
@@ -74,12 +88,20 @@ def processar_feijao(bean_pixels, cnt, N_CORES, PIX_ANALISAR):
         float(hu2),
     ]
 
-    # Adicionar as cores ao vetor e à tabela
+    # Adiciona as cores detetadas
     for j, (color, p) in enumerate(zip(colors, percents)):
         hex_color = f"#{color[2]:02x}{color[1]:02x}{color[0]:02x}"
         row[f"Cor{j + 1}"] = hex_color
         row[f"Cor{j + 1}_%"] = round(float(p * 100), 2)
         features.extend([float(color[0]), float(color[1]), float(color[2]), float(p)])
+
+    # Padding neutro para manter dimensão constante na matriz do KMeans global
+    max_pad = N_CORES_CONFIG
+    dom_color = colors[0] if len(colors) > 0 else [0, 0, 0]
+    for j in range(len(colors), max_pad):
+        features.extend(
+            [float(dom_color[0]), float(dom_color[1]), float(dom_color[2]), 0.0]
+        )
 
     row["Features_Clustering"] = features
     return row
@@ -90,9 +112,8 @@ st.title("Separador de Feijões Avançado")
 
 st.info(
     "**Dica de Processamento:**\n"
-    "* O modelo de IA ignora o fundo automaticamente.\n"
-    "* O agrupamento considera Área, Cores (RGB) e a sua distribuição (%).\n"
-    "* Os 'melhores' feijões de um grupo são avaliados com base no seu tamanho (maior área)."
+    "* O filtro de relevância (%) ignora reflexos ou pequenas variações, reduzindo as cores automaticamente de forma instantânea.\n"
+    "* Ajuste o 'Limiar Mínimo %' se quiser ser mais ou menos rigoroso com cores secundárias."
 )
 
 metodo_entrada = st.radio(
@@ -117,8 +138,8 @@ else:
         foto_cam.name = "captura_camara.png"
         imagens_para_processar = [foto_cam]
 
-with st.expander("Parâmetros de Configuração"):
-    col1, col2, col3 = st.columns(3)
+with st.expander("Parâmetros de Configuração", expanded=True):
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         MIN_AREA = st.number_input("Área mínima (px)", min_value=1, value=500, step=50)
         MIN_CIRCULARIDADE = st.number_input(
@@ -126,16 +147,58 @@ with st.expander("Parâmetros de Configuração"):
         )
 
     with col2:
-        N_CORES = st.number_input(
-            "Número de cores por feijão", min_value=1, value=2, step=1
-        )
-        PIX_ANALISAR = st.number_input(
-            "Pixels a analisar (KMeans)", min_value=100, value=2000, step=100
+        AUTO_CORES = st.toggle("Deteção Auto de Cores", value=True)
+        if AUTO_CORES:
+            N_CORES_CONFIG = st.number_input(
+                "Máximo de cores por feijão (Auto)", min_value=1, max_value=10, value=3, step=1
+            )
+        else:
+            N_CORES_CONFIG = st.number_input(
+                "Nº exato de cores por feijão (Manual)", min_value=1, max_value=10, value=3, step=1
+            )
+        LIMIAR_PCT = st.number_input(
+            "Limiar mínimo de área (%)",
+            min_value=1,
+            max_value=30,
+            value=10,
+            step=1,
+            help="Uma cor só é mantida se ocupar pelo menos esta % da área do feijão.",
+            disabled=not AUTO_CORES,
         )
 
     with col3:
-        NUM_GRUPOS = st.number_input(
-            "Dividir feijões em X Grupos", min_value=1, max_value=10, value=2, step=1
+        AUTO_GRUPOS = st.toggle("Deteção Auto de Grupos", value=True)
+
+        if AUTO_GRUPOS:
+            MAX_GRUPOS_AUTO = st.number_input(
+                "Máximo de Tipos/Grupos (Auto)",
+                min_value=2,
+                max_value=15,
+                value=5,
+                step=1,
+            )
+            N_GRUPOS_MANUAL = 1  # Valor de fallback
+        else:
+            N_GRUPOS_MANUAL = st.number_input(
+                "Nº exato de Grupos (Manual)",
+                min_value=1,
+                max_value=15,
+                value=3,
+                step=1,
+            )
+            MAX_GRUPOS_AUTO = 2  # Valor de fallback
+
+    with col4:
+        PIX_ANALISAR = st.number_input(
+                    "Pixels a analisar (KMeans)", min_value=100, value=1000, step=100
+                )
+        PESO_COR = st.number_input(
+            "Importância da Cor (Peso)",
+            min_value=1.0,
+            max_value=10.0,
+            value=2.0,
+            step=0.5,
+            help="Valores mais altos dão muito mais prioridade à cor do que à forma/tamanho ao agrupar.",
         )
 
 executar = st.button("Executar Processamento")
@@ -179,8 +242,8 @@ if executar and imagens_para_processar:
             new_w = int(img_w * scale)
             new_h = int(img_h * scale)
             img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            img_h, img_w = img.shape[:2]  # Atualizar variáveis de altura e largura
-            
+            img_h, img_w = img.shape[:2]
+
         area_total_imagem = img_h * img_w
         img_clean = img.copy()
 
@@ -221,11 +284,9 @@ if executar and imagens_para_processar:
                     circularidade = 4 * np.pi * (area / (perimetro * perimetro))
 
                     if circularidade >= MIN_CIRCULARIDADE:
-                        # OTIMIZAÇÃO: Extrair Bounding Box e criar apenas uma micro-máscara
                         x, y, w, h = cv2.boundingRect(cnt)
                         mask_roi = np.zeros((h, w), np.uint8)
 
-                        # Deslocar o contorno para desenhar no eixo zero do ROI
                         cnt_offset = cnt - np.array([x, y])
                         cv2.drawContours(mask_roi, [cnt_offset], -1, 255, -1)
 
@@ -246,7 +307,6 @@ if executar and imagens_para_processar:
                 mask_roi = cand["mask_roi"]
                 mapa_roi = mapa_ocupacao[y : y + h, x : x + w]
 
-                # OTIMIZAÇÃO: Bitwise operations apenas no recorte minúsculo
                 intersecao = cv2.bitwise_and(mask_roi, mapa_roi)
                 area_intersecao = np.count_nonzero(intersecao)
                 area_mascara = np.count_nonzero(mask_roi)
@@ -254,16 +314,22 @@ if executar and imagens_para_processar:
                 if area_mascara > 0 and (area_intersecao / area_mascara) > 0.3:
                     continue
 
-                # Atualizar o mapa global usando o recorte local
                 mapa_ocupacao[y : y + h, x : x + w] = cv2.bitwise_or(mapa_roi, mask_roi)
 
-                # OTIMIZAÇÃO: Extrair pixeis imediatamente usando o recorte da imagem
                 img_roi = img[y : y + h, x : x + w]
                 bean_pixels = img_roi[mask_roi == 255].astype(np.float32)
 
-                tasks.append((bean_pixels, cand["cnt"], N_CORES, PIX_ANALISAR))
+                tasks.append(
+                    (
+                        bean_pixels,
+                        cand["cnt"],
+                        AUTO_CORES,
+                        N_CORES_CONFIG,
+                        LIMIAR_PCT,
+                        PIX_ANALISAR,
+                    )
+                )
 
-        # Execução das tarefas otimizada (passando matrizes muito mais leves)
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=os.cpu_count()
         ) as executor:
@@ -271,17 +337,46 @@ if executar and imagens_para_processar:
 
         feijoes_data = [r for r in results if r is not None]
 
-        if len(feijoes_data) >= NUM_GRUPOS > 1:
+        # --- LÓGICA DE AGRUPAMENTO AUTOMÁTICO OU MANUAL COM PESO NA COR ---
+        if len(feijoes_data) > 1:
             features_list = [f["Features_Clustering"] for f in feijoes_data]
             scaler = StandardScaler()
             features_scaled = scaler.fit_transform(features_list)
 
-            kmeans_grupos = KMeans(n_clusters=NUM_GRUPOS, random_state=42, n_init=10)
-            labels_grupos = kmeans_grupos.fit_predict(features_scaled)
+            # Aplicação do Peso de Cor
+            features_scaled[:, 5:] *= PESO_COR
 
-            for row, lbl in zip(feijoes_data, labels_grupos):
+            melhor_k = 1
+            melhores_labels = np.zeros(len(feijoes_data), dtype=int)
+
+            if AUTO_GRUPOS:
+                max_k_possivel = min(MAX_GRUPOS_AUTO, len(feijoes_data) - 1)
+                if max_k_possivel >= 2:
+                    melhor_score = -1
+                    for k in range(2, max_k_possivel + 1):
+                        kmeans_temp = KMeans(n_clusters=k, random_state=42, n_init=10)
+                        labels_temp = kmeans_temp.fit_predict(features_scaled)
+
+                        score = silhouette_score(features_scaled, labels_temp)
+
+                        if score > melhor_score:
+                            melhor_score = score
+                            melhor_k = k
+                            melhores_labels = labels_temp
+            else:
+                # Agrupamento Manual direto sem testar múltiplos 'K'
+                melhor_k = min(N_GRUPOS_MANUAL, len(feijoes_data))
+                if melhor_k >= 2:
+                    kmeans_manual = KMeans(
+                        n_clusters=melhor_k, random_state=42, n_init=10
+                    )
+                    melhores_labels = kmeans_manual.fit_predict(features_scaled)
+
+            num_grupos_final = melhor_k
+            for row, lbl in zip(feijoes_data, melhores_labels):
                 row["Grupo"] = f"Tipo {lbl + 1}"
         else:
+            num_grupos_final = 1
             for row in feijoes_data:
                 row["Grupo"] = "Tipo 1"
 
@@ -299,14 +394,15 @@ if executar and imagens_para_processar:
                 resumo_grupos[g_str] = {"areas": [], "r": [], "g": [], "b": []}
             resumo_grupos[g_str]["areas"].append(row["Area_px"])
 
-            hex_c = row["Cor1"].lstrip("#")
-            if len(hex_c) == 6:
-                r_val, g_val, b_val = tuple(
-                    int(hex_c[k : k + 2], 16) for k in (0, 2, 4)
-                )
-                resumo_grupos[g_str]["r"].append(r_val)
-                resumo_grupos[g_str]["g"].append(g_val)
-                resumo_grupos[g_str]["b"].append(b_val)
+            if "Cor1" in row and isinstance(row["Cor1"], str):
+                hex_c = row["Cor1"].lstrip("#")
+                if len(hex_c) == 6:
+                    r_val, g_val, b_val = tuple(
+                        int(hex_c[k : k + 2], 16) for k in (0, 2, 4)
+                    )
+                    resumo_grupos[g_str]["r"].append(r_val)
+                    resumo_grupos[g_str]["g"].append(g_val)
+                    resumo_grupos[g_str]["b"].append(b_val)
 
             x, y, w, h = cv2.boundingRect(cnt)
             M = cv2.moments(cnt)
@@ -340,7 +436,7 @@ if executar and imagens_para_processar:
                 "img_clean": img_clean,
                 "coords": coordenadas_feijoes,
                 "tabela": df_imagem,
-                "resumo_grupos": resumo_grupos if NUM_GRUPOS > 1 else {},
+                "resumo_grupos": resumo_grupos if num_grupos_final > 1 else {},
             }
         )
 
@@ -361,7 +457,6 @@ if st.session_state.resultados_imagens:
             return f"background-color: {valor}; color: {valor};"
         return ""
 
-    # Dicionário de 10 cores BGR globais (OpenCV)
     cores_bgr_global = {
         1: (0, 255, 0),
         2: (255, 0, 0),
@@ -387,7 +482,6 @@ if st.session_state.resultados_imagens:
 
         st.subheader(f"Imagem: {nome_img}")
 
-        # --- CONTROLOS DE VISUALIZAÇÃO ---
         ctrl_col1, ctrl_col2, ctrl_col3 = st.columns(3)
         with ctrl_col1:
             largura_img = st.slider(
@@ -408,10 +502,8 @@ if st.session_state.resultados_imagens:
                 key=f"search_{nome_img}_{idx}",
             )
 
-        # --- FILTROS ---
         st.markdown("###### Filtro de Destaque")
 
-        # Estrutura plana de colunas para layout de filtros
         filt_col1, filt_col2, filt_col3, filt_col4 = st.columns(
             [1.5, 0.4, 1.5, 2.5], vertical_alignment="center"
         )
@@ -439,7 +531,6 @@ if st.session_state.resultados_imagens:
                 key=f"topx_{nome_img}_{idx}",
             )
 
-        # --- DESENHO DINÂMICO DOS CONTORNOS ---
         img_display = img_clean.copy()
 
         feijoes_a_desenhar = set(coords.keys())
@@ -481,7 +572,6 @@ if st.session_state.resultados_imagens:
                         max(1, int(tamanho_num * 2)),
                     )
 
-        # --- PREPARAÇÃO DA IMAGEM PARA DESCARREGAR (COM LEGENDA NO FUNDO) ---
         img_download = img_display.copy()
 
         if resumo_grupos:
@@ -506,13 +596,25 @@ if st.session_state.resultados_imagens:
             )
             y_offset += 35
 
-            for g_num in range(1, 11):
+            for g_num in range(1, 16):
                 g_str = f"Tipo {g_num}"
                 if g_str in resumo_grupos and len(resumo_grupos[g_str]["areas"]) > 0:
                     avg_a = int(np.mean(resumo_grupos[g_str]["areas"]))
-                    avg_r = int(np.mean(resumo_grupos[g_str]["r"]))
-                    avg_g = int(np.mean(resumo_grupos[g_str]["g"]))
-                    avg_b = int(np.mean(resumo_grupos[g_str]["b"]))
+                    avg_r = (
+                        int(np.mean(resumo_grupos[g_str]["r"]))
+                        if resumo_grupos[g_str]["r"]
+                        else 0
+                    )
+                    avg_g = (
+                        int(np.mean(resumo_grupos[g_str]["g"]))
+                        if resumo_grupos[g_str]["g"]
+                        else 0
+                    )
+                    avg_b = (
+                        int(np.mean(resumo_grupos[g_str]["b"]))
+                        if resumo_grupos[g_str]["b"]
+                        else 0
+                    )
 
                     cor_contorno = cores_bgr_global.get(g_num, (255, 255, 255))
 
@@ -564,14 +666,12 @@ if st.session_state.resultados_imagens:
 
             img_download = img_padded
 
-        # Codificar imagens
         _, img_encoded_display = cv2.imencode(".png", img_display)
         img_bytes_display = img_encoded_display.tobytes()
 
         _, img_encoded_dl = cv2.imencode(".png", img_download)
         img_bytes_dl = img_encoded_dl.tobytes()
 
-        # Mostrar imagem na UI
         img_b64 = base64.b64encode(img_bytes_display).decode("utf-8")
         html_code = f"""
         <div style="max-width: 100%; max-height: 80vh; overflow: auto; border: 1px solid #444; border-radius: 5px; width: fit-content; margin: 0 auto; margin-bottom: 20px;">
@@ -580,17 +680,28 @@ if st.session_state.resultados_imagens:
         """
         st.markdown(html_code, unsafe_allow_html=True)
 
-        # --- LEGENDA CENTRADA ---
         if resumo_grupos:
             legend_html = "<div style='display: flex; flex-wrap: wrap; justify-content: center; gap: 20px; padding: 15px; border: 1px solid rgba(255,255,255,0.2); border-radius: 8px; background-color: rgba(0,0,0,0.2); margin: 0 auto 30px auto; width: fit-content;'>"
 
-            for g_num in range(1, 11):
+            for g_num in range(1, 16):
                 g_str = f"Tipo {g_num}"
                 if g_str in resumo_grupos and len(resumo_grupos[g_str]["areas"]) > 0:
                     avg_a = int(np.mean(resumo_grupos[g_str]["areas"]))
-                    avg_r = int(np.mean(resumo_grupos[g_str]["r"]))
-                    avg_g = int(np.mean(resumo_grupos[g_str]["g"]))
-                    avg_b = int(np.mean(resumo_grupos[g_str]["b"]))
+                    avg_r = (
+                        int(np.mean(resumo_grupos[g_str]["r"]))
+                        if resumo_grupos[g_str]["r"]
+                        else 0
+                    )
+                    avg_g = (
+                        int(np.mean(resumo_grupos[g_str]["g"]))
+                        if resumo_grupos[g_str]["g"]
+                        else 0
+                    )
+                    avg_b = (
+                        int(np.mean(resumo_grupos[g_str]["b"]))
+                        if resumo_grupos[g_str]["b"]
+                        else 0
+                    )
 
                     cores_rgb = {
                         1: (0, 255, 0),
@@ -617,7 +728,6 @@ if st.session_state.resultados_imagens:
             legend_html += "</div>"
             st.markdown(legend_html, unsafe_allow_html=True)
 
-        # Botão de descarregar numa nova linha, centrado abaixo da legenda
         dl_col1, dl_col2, dl_col3 = st.columns([1, 0.7, 1])
         with dl_col2:
             st.download_button(
