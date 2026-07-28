@@ -14,11 +14,11 @@ st.set_page_config(page_title="Separador de Feijões com IA", layout="wide")
 
 
 # --- Função OTIMIZADA para processar cada feijão ---
-# Agora recebe apenas os pixeis já extraídos, poupando memória no Multithreading
 def processar_feijao(bean_pixels, cnt, N_CORES, PIX_ANALISAR):
     if len(bean_pixels) == 0:
         return None
 
+    # 1. Processamento de Cor (KMeans)
     kmeans = MiniBatchKMeans(
         n_clusters=N_CORES,
         random_state=42,
@@ -43,11 +43,38 @@ def processar_feijao(bean_pixels, cnt, N_CORES, PIX_ANALISAR):
     colors = colors[lum_idx]
     percents = percents[lum_idx]
 
+    # 2. Extração de Métricas de Tamanho e Forma
     area = cv2.contourArea(cnt)
+
+    # Bounding Box para calcular a Proporção (Alongamento)
+    x, y, w, h = cv2.boundingRect(cnt)
+    aspect_ratio = float(w) / h if h != 0 else 0.0
+
+    # Convex Hull para calcular a Solidez (Feijões "Tortos")
+    hull = cv2.convexHull(cnt)
+    hull_area = cv2.contourArea(hull)
+    solidity = float(area) / hull_area if hull_area != 0 else 0.0
+
+    # Momentos de Hu para caracterização avançada da forma (invariante à rotação)
+    moments = cv2.moments(cnt)
+    hu_moments = cv2.HuMoments(moments).flatten()
+    hu1 = -np.sign(hu_moments[0]) * np.log10(abs(hu_moments[0]) + 1e-10)
+    hu2 = -np.sign(hu_moments[1]) * np.log10(abs(hu_moments[1]) + 1e-10)
+
+    # 3. Guardar dados para a Tabela Visual (AGORA APENAS COM ÁREA E CONTORNO)
     row = {"Contorno": cnt, "Area_px": int(area)}
 
-    features = [float(area)]
+    # 4. Construir o Vetor de Características para o IA agrupar
+    # As métricas de forma entram aqui para formar os grupos, mas ficam ocultas da tabela
+    features = [
+        float(area),
+        float(aspect_ratio),
+        float(solidity),
+        float(hu1),
+        float(hu2),
+    ]
 
+    # Adicionar as cores ao vetor e à tabela
     for j, (color, p) in enumerate(zip(colors, percents)):
         hex_color = f"#{color[2]:02x}{color[1]:02x}{color[0]:02x}"
         row[f"Cor{j + 1}"] = hex_color
@@ -144,7 +171,16 @@ if executar and imagens_para_processar:
             st.error(f"Não foi possível abrir a imagem {nome_original}.")
             continue
 
+        MAX_DIMENSION = 1280
         img_h, img_w = img.shape[:2]
+
+        if max(img_h, img_w) > MAX_DIMENSION:
+            scale = MAX_DIMENSION / max(img_h, img_w)
+            new_w = int(img_w * scale)
+            new_h = int(img_h * scale)
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            img_h, img_w = img.shape[:2]  # Atualizar variáveis de altura e largura
+            
         area_total_imagem = img_h * img_w
         img_clean = img.copy()
 
