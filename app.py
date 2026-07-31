@@ -13,22 +13,21 @@ from ultralytics import FastSAM
 # Configuração da página do Streamlit
 st.set_page_config(page_title="Separador de Feijões", layout="wide")
 
-
-# --- Função OTIMIZADA e ULTRA-RÁPIDA para processar cada feijão ---
+# --- Função OTIMIZADA para processar cada feijão ---
 def processar_feijao(
-    bean_pixels, cnt, AUTO_CORES, N_CORES_CONFIG, LIMIAR_PCT, PIX_ANALISAR
+    bean_pixels, cnt, AUTO_CORES, N_CORES_CONFIG, LIMIAR_PCT
 ):
     if len(bean_pixels) == 0:
         return None
 
-    # 1. Amostragem rápida de pixéis
-    if len(bean_pixels) > PIX_ANALISAR:
-        idx = np.random.choice(len(bean_pixels), PIX_ANALISAR, replace=False)
-        pixels_sample = bean_pixels[idx]
-    else:
-        pixels_sample = bean_pixels
+    # 1. Utiliza a totalidade dos pixeis (Elimina a inconsistência)
+    pixels_sample = bean_pixels
 
-    # 2. Executa KMeans UMA ÚNICA VEZ (sem ciclos lentos)
+    # 2. Calcula a Cor Média real e o nível de manchas (Desvio Padrão)
+    cor_media = np.mean(pixels_sample, axis=0)
+    std_cor = np.std(pixels_sample, axis=0)
+
+    # 3. Executa KMeans UMA ÚNICA VEZ
     kmeans = MiniBatchKMeans(
         n_clusters=N_CORES_CONFIG,
         random_state=42,
@@ -62,7 +61,7 @@ def processar_feijao(
     colors = colors[lum_idx]
     percents = percents[lum_idx]
 
-    # 3. Extração de Métricas de Tamanho e Forma
+    # 4. Extração de Métricas de Tamanho e Forma
     area = cv2.contourArea(cnt)
     x, y, w, h = cv2.boundingRect(cnt)
     aspect_ratio = float(w) / h if h != 0 else 0.0
@@ -76,16 +75,20 @@ def processar_feijao(
     hu1 = -np.sign(hu_moments[0]) * np.log10(abs(hu_moments[0]) + 1e-10)
     hu2 = -np.sign(hu_moments[1]) * np.log10(abs(hu_moments[1]) + 1e-10)
 
-    # 4. Guardar dados para a Tabela Visual
-    row = {"Contorno": cnt, "Area_px": int(area)}
+    # 5. Guardar dados para a Tabela Visual (Inclui Média Exata)
+    row = {
+        "Contorno": cnt, 
+        "Area_px": int(area),
+        "Media_B": float(cor_media[0]),
+        "Media_G": float(cor_media[1]),
+        "Media_R": float(cor_media[2])
+    }
 
-    # 5. Construir o Vetor de Características para a IA agrupar
+    # 6. Construir o Vetor de Características para a IA agrupar
     features = [
-        float(area),
-        float(aspect_ratio),
-        float(solidity),
-        float(hu1),
-        float(hu2),
+        float(area), float(aspect_ratio), float(solidity), float(hu1), float(hu2),
+        float(cor_media[0]), float(cor_media[1]), float(cor_media[2]), # Cor Base
+        float(std_cor[0]), float(std_cor[1]), float(std_cor[2])        # Variação/Manchas
     ]
 
     # Adiciona as cores detetadas
@@ -161,7 +164,7 @@ with st.expander("Parâmetros de Configuração", expanded=False):
         AUTO_CORES = st.toggle("Deteção Auto de Cores", value=True)
         if AUTO_CORES:
             N_CORES_CONFIG = st.number_input(
-                "Máximo de cores por feijão (Auto)", min_value=1, max_value=10, value=3, step=1
+                "Máximo de cores por feijão (Auto)", min_value=1, max_value=10, value=5, step=1
             )
         else:
             N_CORES_CONFIG = st.number_input(
@@ -171,7 +174,7 @@ with st.expander("Parâmetros de Configuração", expanded=False):
             "Limiar mínimo de área (%)",
             min_value=1,
             max_value=30,
-            value=10,
+            value=5,
             step=1,
             help="Uma cor só é mantida se ocupar pelo menos esta % da área do feijão.",
             disabled=not AUTO_CORES,
@@ -200,9 +203,6 @@ with st.expander("Parâmetros de Configuração", expanded=False):
             MAX_GRUPOS_AUTO = 2  # Valor de fallback
 
     with col4:
-        PIX_ANALISAR = st.number_input(
-                    "Pixels a analisar (KMeans)", min_value=100, value=1000, step=100
-                )
         PESO_COR = st.number_input(
             "Importância da Cor (Peso)",
             min_value=1.0,
@@ -336,8 +336,7 @@ if executar and imagens_para_processar:
                         cand["cnt"],
                         AUTO_CORES,
                         N_CORES_CONFIG,
-                        LIMIAR_PCT,
-                        PIX_ANALISAR,
+                        LIMIAR_PCT
                     )
                 )
 
@@ -405,15 +404,15 @@ if executar and imagens_para_processar:
                 resumo_grupos[g_str] = {"areas": [], "r": [], "g": [], "b": []}
             resumo_grupos[g_str]["areas"].append(row["Area_px"])
 
-            if "Cor1" in row and isinstance(row["Cor1"], str):
-                hex_c = row["Cor1"].lstrip("#")
-                if len(hex_c) == 6:
-                    r_val, g_val, b_val = tuple(
-                        int(hex_c[k : k + 2], 16) for k in (0, 2, 4)
-                    )
-                    resumo_grupos[g_str]["r"].append(r_val)
-                    resumo_grupos[g_str]["g"].append(g_val)
-                    resumo_grupos[g_str]["b"].append(b_val)
+            # Utiliza a Cor Média Exata gravada previamente
+            if "Media_R" in row:
+                resumo_grupos[g_str]["r"].append(row["Media_R"])
+                resumo_grupos[g_str]["g"].append(row["Media_G"])
+                resumo_grupos[g_str]["b"].append(row["Media_B"])
+                # Remove do display da tabela (opcional, para ficar mais limpo)
+                row.pop("Media_R")
+                row.pop("Media_G")
+                row.pop("Media_B")
 
             x, y, w, h = cv2.boundingRect(cnt)
             M = cv2.moments(cnt)
